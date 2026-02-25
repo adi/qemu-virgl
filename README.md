@@ -10,14 +10,15 @@ No third-party taps. No outdated formulas. Just upstream sources and proper engi
 | **QEMU** | 10.2.50 (main) | https://gitlab.com/qemu-project/qemu |
 | **virglrenderer** | 1.3.0+ (main) | https://gitlab.freedesktop.org/virgl/virglrenderer |
 | **libepoxy** | 1.5.11 (main) | https://github.com/anholt/libepoxy |
+| **SDL2** | 2.x (SDL2 branch) | https://github.com/libsdl-org/SDL |
 
 GPU backend chain: **virtio-gpu-gl** → virglrenderer (EGL + Venus) → Mesa EGL → MoltenVK → **Metal**
 
 ## Prerequisites
 
 ```bash
-brew install meson ninja pkg-config
-brew install glib pixman sdl2 libepoxy
+brew install meson ninja pkg-config cmake
+brew install glib pixman libepoxy
 brew install libslirp lzo snappy gnutls nettle libusb vde spice-protocol
 brew install mesa molten-vk vulkan-headers vulkan-loader
 brew install libssh jpeg-turbo
@@ -26,6 +27,9 @@ brew install libssh jpeg-turbo
 > **Important**: GNU binutils is incompatible with macOS `ld`. If you have it installed,
 > ensure `/usr/bin` appears before `/opt/homebrew/opt/binutils/bin` in your PATH,
 > or the build scripts handle it automatically via hardcoded `/usr/bin/ar` and `/usr/bin/ranlib`.
+
+> **Do NOT** `brew install sdl2` — the homebrew SDL2 uses Apple's broken OpenGL.framework
+> (crashes on macOS 26.1). We build SDL2 from source with EGL support.
 
 ## Build
 
@@ -37,6 +41,7 @@ cd qemu-virgl
 git clone https://github.com/anholt/libepoxy.git
 git clone https://gitlab.freedesktop.org/virgl/virglrenderer.git
 git clone https://gitlab.com/qemu-project/qemu.git --depth=1
+git clone https://github.com/libsdl-org/SDL.git --branch SDL2 SDL
 
 # Build everything
 ./build.sh
@@ -57,7 +62,7 @@ The first build takes ~10-15 minutes. Subsequent builds are incremental.
 ./run-vm.sh mydisk.qcow2
 ```
 
-The VM uses `virtio-gpu-gl` with SDL display and OpenGL enabled.
+The VM uses `virtio-gpu-gl` with SDL display and OpenGL ES enabled (`-display sdl,gl=es`).
 
 ## What was fixed / why it works
 
@@ -95,6 +100,22 @@ Additionally, meson's `-D` (deterministic) flag for `ar` is macOS-incompatible; 
 Meson uses `STATIC_LINKER_RSP` with `ar $flags $out @$out.rsp` for large libraries.
 **Fix**: `macos-compat/ar-wrapper.sh` expands the response file before passing to ar.
 
+### Problem 6: Apple OpenGL.framework crashes on macOS 26.1
+
+The homebrew SDL2 uses Apple's deprecated CGL (Core OpenGL) backend.
+On macOS 26.1, `CGLChoosePixelFormat` crashes with a fatal address sentinel (`0xbad4007`).
+**Fix**: Build SDL2 from source with `SDL_OPENGLES=ON` which selects Mesa EGL instead of CGL.
+Use `-display sdl,gl=es` when launching QEMU.
+
+### Problem 7: QEMU linker can't find `libsnappy`/`libfdt`
+
+Meson generates per-target `LINK_ARGS` that lack `-L/opt/homebrew/lib`, while bare `-lsnappy`
+and `-lfdt` appear in `$in` (which comes before `LINK_ARGS` in the linker command).
+macOS ld requires `-L` to precede any `-l` that uses it.
+**Fix**: The build script patches `build.ninja` to:
+1. Move `LINK_ARGS` before `$in` in the linker command template
+2. Prepend `-L` paths to the per-target `LINK_ARGS` of executable targets
+
 ## Architecture
 
 ```
@@ -108,3 +129,4 @@ Host (macOS)
             ├─ EGL context (Mesa 26 libEGL)
             │    └─ Vulkan backend (MoltenVK 1.4.0 → Metal)
             └─ Venus protocol (Vulkan passthrough via MoltenVK)
+```
