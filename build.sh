@@ -143,29 +143,40 @@ echo ""
 echo "==> Patching QEMU source for macOS GL/EGL..."
 cd "$ROOT/qemu"
 
-# Fix: sdl2_window_create doesn't set GL_CONTEXT_PROFILE_MASK=ES before creating
-# the initial winctx when gl=es mode is active. Without this, SDL creates a desktop
-# GL context, which can't compile "#version 300 es" shaders → "compile error (null)".
+# Fix: SDL_GL_SetAttribute for GLES must be called BEFORE SDL_CreateWindow.
+# EGL chooses its framebuffer config at window-creation time, not at
+# SDL_GL_CreateContext time. Setting profile/version after SDL_CreateWindow
+# causes SDL_GL_CreateContext to return NULL → "glCreateShader without context".
 python3 -c "
 path = 'ui/sdl2.c'
 content = open(path).read()
-old = '''        if (scon->opts->gl == DISPLAY_GL_MODE_ES) {
-            driver = \"opengles2\";
-        }
+old = '''    if (scon->opengl) {
+        flags |= SDL_WINDOW_OPENGL;
+    }
+#endif
 
-        SDL_SetHint(SDL_HINT_RENDER_DRIVER, driver);'''
-new = '''        if (scon->opts->gl == DISPLAY_GL_MODE_ES) {
-            driver = \"opengles2\";
+    scon->real_window = SDL_CreateWindow'''
+new = '''    if (scon->opengl) {
+        flags |= SDL_WINDOW_OPENGL;
+        if (scon->opts->gl == DISPLAY_GL_MODE_ES) {
             SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,
                                 SDL_GL_CONTEXT_PROFILE_ES);
             SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
             SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
         }
+    }
+#endif
 
-        SDL_SetHint(SDL_HINT_RENDER_DRIVER, driver);'''
+    scon->real_window = SDL_CreateWindow'''
 if old in content:
-    open(path, 'w').write(content.replace(old, new))
-    print('Patched ui/sdl2.c: set GLES 3.0 context before SDL_GL_CreateContext')
+    content = content.replace(old, new)
+    # Also add error check after SDL_GL_CreateContext
+    content = content.replace(
+        'scon->winctx = SDL_GL_CreateContext(scon->real_window);\n        SDL_GL_SetSwapInterval(0);',
+        'scon->winctx = SDL_GL_CreateContext(scon->real_window);\n        if (!scon->winctx) { fprintf(stderr, \"SDL_GL_CreateContext failed: %s\\n\", SDL_GetError()); }\n        SDL_GL_SetSwapInterval(0);'
+    )
+    open(path, 'w').write(content)
+    print('Patched ui/sdl2.c: moved SDL_GL_SetAttribute before SDL_CreateWindow')
 elif 'SDL_GL_CONTEXT_PROFILE_ES' in content:
     print('ui/sdl2.c already patched')
 else:
