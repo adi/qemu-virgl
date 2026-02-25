@@ -1,0 +1,6 @@
+install/
+libepoxy/
+virglrenderer/
+qemu/
+*.pyc
+__pycache__/
