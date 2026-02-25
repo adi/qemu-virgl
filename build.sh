@@ -41,6 +41,44 @@ echo ""
 echo "==> Building libepoxy..."
 cd "$ROOT/libepoxy"
 
+# Patch libepoxy to use Mesa's GL/EGL/GLES libs instead of Apple's OpenGL.framework.
+# Apple's libGL crashes (NULL dereference in glGetString) without a CGL context active.
+python3 -c "
+import sys
+mesa = sys.argv[1]
+path = 'src/dispatch_common.c'
+content = open(path).read()
+# Replace the Apple #if block's lib defines to point to Mesa
+old = '''#if defined(__APPLE__)
+#define GLX_LIB \"/opt/X11/lib/libGL.1.dylib\"
+#define OPENGL_LIB \"/System/Library/Frameworks/OpenGL.framework/Versions/Current/OpenGL\"
+#define EGL_LIB \"libEGL.dylib\"
+#define GLES1_LIB \"libGLESv1_CM.dylib\"
+#define GLES2_LIB \"libGLESv2.dylib\"'''
+new = '''#if defined(__APPLE__)
+#define GLX_LIB \"/opt/X11/lib/libGL.1.dylib\"
+/* Use Mesa libs instead of Apple OpenGL.framework (crashes on macOS 26.1 without CGL context) */
+#define OPENGL_LIB \"''' + mesa + '''/lib/libGL.dylib\"
+#define EGL_LIB \"''' + mesa + '''/lib/libEGL.dylib\"
+#define GLES1_LIB \"''' + mesa + '''/lib/libGLESv1_CM.dylib\"
+#define GLES2_LIB \"''' + mesa + '''/lib/libGLESv2.dylib\"'''
+if old in content:
+    content = content.replace(old, new)
+    open(path, 'w').write(content)
+    print('Patched libepoxy dispatch_common.c: OPENGL_LIB -> Mesa')
+else:
+    # Already patched or different version - just ensure OPENGL_LIB is not Apple
+    if 'OpenGL.framework' in content:
+        content = content.replace(
+            '/System/Library/Frameworks/OpenGL.framework/Versions/Current/OpenGL',
+            mesa + '/lib/libGL.dylib'
+        )
+        open(path, 'w').write(content)
+        print('Patched OPENGL_LIB in dispatch_common.c')
+    else:
+        print('libepoxy already patched')
+" "$MESA"
+
 CFLAGS="$CFLAGS_EXTRA" \
 meson setup build \
     --prefix="$INSTALL" \

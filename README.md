@@ -100,14 +100,22 @@ Additionally, meson's `-D` (deterministic) flag for `ar` is macOS-incompatible; 
 Meson uses `STATIC_LINKER_RSP` with `ar $flags $out @$out.rsp` for large libraries.
 **Fix**: `macos-compat/ar-wrapper.sh` expands the response file before passing to ar.
 
-### Problem 6: Apple OpenGL.framework crashes on macOS 26.1
+### Problem 6: libepoxy loads Apple's libGL.dylib → crash in glGetString
+
+libepoxy's `dispatch_common.c` defines `OPENGL_LIB` as Apple's OpenGL.framework on macOS.
+When `epoxy_is_desktop_gl()` calls `glGetString(GL_VERSION)` via Apple's libGL, it crashes
+at NULL+offset (`0x3b0`) because there is no Apple CGL context active.
+**Fix**: Changed `OPENGL_LIB` (and all GLES/EGL lib paths) to point to Mesa's dylibs in
+`/opt/homebrew/Cellar/mesa/26.0.0/lib/`.
+
+### Problem 8: Apple OpenGL.framework crashes on macOS 26.1 (SDL2/CGL)
 
 The homebrew SDL2 uses Apple's deprecated CGL (Core OpenGL) backend.
 On macOS 26.1, `CGLChoosePixelFormat` crashes with a fatal address sentinel (`0xbad4007`).
 **Fix**: Build SDL2 from source with `SDL_OPENGLES=ON` which selects Mesa EGL instead of CGL.
 Use `-display sdl,gl=es` when launching QEMU.
 
-### Problem 7: QEMU linker can't find `libsnappy`/`libfdt`
+### Problem 9: QEMU linker can't find `libsnappy`/`libfdt`
 
 Meson generates per-target `LINK_ARGS` that lack `-L/opt/homebrew/lib`, while bare `-lsnappy`
 and `-lfdt` appear in `$in` (which comes before `LINK_ARGS` in the linker command).
