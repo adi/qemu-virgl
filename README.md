@@ -124,6 +124,19 @@ macOS ld requires `-L` to precede any `-l` that uses it.
 1. Move `LINK_ARGS` before `$in` in the linker command template
 2. Prepend `-L` paths to the per-target `LINK_ARGS` of executable targets
 
+### Problem 10: QEMU SDL2 creates desktop GL context instead of GLES for winctx
+
+`sdl2_window_create` calls `SDL_GL_CreateContext` without setting `SDL_GL_CONTEXT_PROFILE_MASK=ES`
+first. The resulting `winctx` is a desktop GL context. When `qemu_gl_init_shader()` is called
+(still on that `winctx`), it tries to compile `#version 300 es` shaders against desktop GL,
+which fails with "compile vertex error (null)" and no info log.
+**Fix**: In `ui/sdl2.c`, before `SDL_GL_CreateContext` when `gl=es`, set:
+```c
+SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+```
+
 ## Architecture
 
 ```

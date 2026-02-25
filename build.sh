@@ -140,8 +140,40 @@ cmake --install build
 
 # ── 4. QEMU (with virgl + HVF + SDL) ─────────────────────────────────────────
 echo ""
-echo "==> Configuring QEMU..."
+echo "==> Patching QEMU source for macOS GL/EGL..."
 cd "$ROOT/qemu"
+
+# Fix: sdl2_window_create doesn't set GL_CONTEXT_PROFILE_MASK=ES before creating
+# the initial winctx when gl=es mode is active. Without this, SDL creates a desktop
+# GL context, which can't compile "#version 300 es" shaders → "compile error (null)".
+python3 -c "
+path = 'ui/sdl2.c'
+content = open(path).read()
+old = '''        if (scon->opts->gl == DISPLAY_GL_MODE_ES) {
+            driver = \"opengles2\";
+        }
+
+        SDL_SetHint(SDL_HINT_RENDER_DRIVER, driver);'''
+new = '''        if (scon->opts->gl == DISPLAY_GL_MODE_ES) {
+            driver = \"opengles2\";
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,
+                                SDL_GL_CONTEXT_PROFILE_ES);
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+        }
+
+        SDL_SetHint(SDL_HINT_RENDER_DRIVER, driver);'''
+if old in content:
+    open(path, 'w').write(content.replace(old, new))
+    print('Patched ui/sdl2.c: set GLES 3.0 context before SDL_GL_CreateContext')
+elif 'SDL_GL_CONTEXT_PROFILE_ES' in content:
+    print('ui/sdl2.c already patched')
+else:
+    print('WARNING: could not patch ui/sdl2.c - pattern not found', flush=True)
+"
+
+echo ""
+echo "==> Configuring QEMU..."
 
 PYTHON=/opt/homebrew/bin/python3.13 \
 bash ./configure \
