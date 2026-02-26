@@ -85,6 +85,36 @@ meson setup build \
     -Degl=yes -Dglx=no -Dx11=false -Dtests=false \
     2>&1 | tail -5
 
+# Fix epoxy_conservative_egl_version to return 14 (conservative minimum) when
+# eglQueryString(EGL_VERSION) returns NULL (EGL_NOT_INITIALIZED).  Mesa on
+# macOS surfaceless EGL can return a non-NULL display handle that is in a
+# partially-initialised state during early GL dispatch, causing the version
+# query to fail and libepoxy to abort with "No provider of eglGetCurrentContext".
+python3 -c "
+path = 'src/dispatch_egl.c'
+content = open(path).read()
+old = '    return epoxy_egl_version(dpy);\n}'
+new = '''    int v = epoxy_egl_version(dpy);
+
+    /* Mesa on macOS (surfaceless EGL) may return a display handle for which
+     * eglQueryString(EGL_VERSION) fails with EGL_NOT_INITIALIZED during early
+     * GL dispatch.  Return the conservative minimum so basic EGL 1.4 functions
+     * can still be dispatched. */
+    if (v == 0)
+        return 14;
+
+    return v;
+}'''
+if old in content:
+    content = content.replace(old, new)
+    open(path, 'w').write(content)
+    print('Patched libepoxy dispatch_egl.c: conservative EGL version fallback')
+elif 'if (v == 0)' in content:
+    print('dispatch_egl.c already patched')
+else:
+    print('WARNING: could not patch dispatch_egl.c', flush=True)
+"
+
 python3 -c "
 content = open('build/build.ninja').read()
 fixed = content.replace('&& ranlib -c \$out', '&& /usr/bin/ranlib -c \$out')
@@ -119,8 +149,62 @@ ninja -C build install
 # macOS 26.1 has a broken Apple OpenGL.framework (CGLChoosePixelFormat crashes).
 # Build SDL2 with SDL_OPENGLES=ON to use Mesa EGL instead of Apple CGL.
 echo ""
-echo "==> Building SDL2 (EGL/GLES2 backend)..."
+echo "==> Patching SDL2 source for Mesa surfaceless EGL on macOS..."
 cd "$ROOT/SDL"
+
+# Patch SDL_cocoaopengles.m:
+#   1. Use EGL_PLATFORM_SURFACELESS_MESA so Mesa's eglGetPlatformDisplayEXT is used
+#      (eglGetDisplay(EGL_DEFAULT_DISPLAY) fails on macOS with Mesa → "Invalid window")
+#   2. Set is_offscreen=true so SDL_EGL_ChooseConfig adds EGL_PBUFFER_BIT
+#      (without it, eglCreatePbufferSurface fails on the chosen config)
+#   3. Create a pbuffer surface instead of a CALayer window surface
+#      (Mesa surfaceless EGL only supports pbuffer, not native window surfaces)
+python3 -c "
+import re, sys
+mesa = sys.argv[1]
+path = 'src/video/cocoa/SDL_cocoaopengles.m'
+content = open(path).read()
+
+# 1. Add EGL_PLATFORM_SURFACELESS_MESA define after the includes
+define_block = '''/* Mesa surfaceless platform — eglGetDisplay(EGL_DEFAULT_DISPLAY) fails on macOS
+ * with Mesa, but eglGetPlatformDisplayEXT(EGL_PLATFORM_SURFACELESS_MESA, ...) works.
+ */
+#ifndef EGL_PLATFORM_SURFACELESS_MESA
+#define EGL_PLATFORM_SURFACELESS_MESA 0x31DD
+#endif'''
+marker = '/* EGL implementation of SDL OpenGL support */'
+if define_block not in content:
+    content = content.replace(marker, marker + '\n\n' + define_block)
+
+# 2. Change platform=0 to EGL_PLATFORM_SURFACELESS_MESA in both LoadLibrary calls
+content = content.replace(
+    'SDL_EGL_LoadLibrary(_this, NULL, EGL_DEFAULT_DISPLAY, 0)',
+    'SDL_EGL_LoadLibrary(_this, NULL, EGL_DEFAULT_DISPLAY, EGL_PLATFORM_SURFACELESS_MESA)'
+)
+
+# 3. Remove unused NSView* v; declaration
+content = re.sub(r'int Cocoa_GLES_SetupWindow\(_THIS, SDL_Window \* window\)\n\{\n    NSView\* v;\n',
+                 'int Cocoa_GLES_SetupWindow(_THIS, SDL_Window * window)\n{\n', content)
+
+# 4. Set is_offscreen=SDL_TRUE and use pbuffer instead of CALayer surface
+old_surface = '''    /* Create the GLES window surface */
+    v = windowdata.nswindow.contentView;
+    windowdata.egl_surface = SDL_EGL_CreateSurface(_this, (__bridge NativeWindowType)[v layer]);'''
+new_surface = '''    /* Signal that we use an offscreen (pbuffer) surface so SDL_EGL_ChooseConfig
+     * adds EGL_SURFACE_TYPE = EGL_PBUFFER_BIT (required by Mesa surfaceless EGL). */
+    _this->egl_data->is_offscreen = SDL_TRUE;
+
+    /* Create the GLES window surface as a pbuffer (Mesa surfaceless EGL does not
+     * support native window surfaces; use an offscreen pbuffer instead). */
+    windowdata.egl_surface = SDL_EGL_CreateOffscreenSurface(_this, window->w, window->h);'''
+if old_surface in content:
+    content = content.replace(old_surface, new_surface)
+
+open(path, 'w').write(content)
+print('Patched SDL_cocoaopengles.m: surfaceless EGL + pbuffer surface')
+" "$MESA"
+
+echo "==> Building SDL2 (EGL/GLES2 backend)..."
 
 cmake -S . -B build \
     -DCMAKE_INSTALL_PREFIX="$INSTALL" \
@@ -143,21 +227,30 @@ echo ""
 echo "==> Patching QEMU source for macOS GL/EGL..."
 cd "$ROOT/qemu"
 
-# Fix: SDL_GL_SetAttribute for GLES must be called BEFORE SDL_CreateWindow.
-# EGL chooses its framebuffer config at window-creation time, not at
-# SDL_GL_CreateContext time. Setting profile/version after SDL_CreateWindow
-# causes SDL_GL_CreateContext to return NULL → "glCreateShader without context".
+# Fix 1: SDL_GL_SetAttribute for GLES must be called BEFORE SDL_CreateWindow.
+# Fix 2: After creating the GL context, also create a Metal SDL renderer for
+#         the readback display path (Mesa surfaceless EGL has no native window
+#         surface, so we glReadPixels → SDL_Texture → Metal renderer instead of
+#         SDL_GL_SwapWindow).
 python3 -c "
 path = 'ui/sdl2.c'
 content = open(path).read()
-old = '''    if (scon->opengl) {
+
+# Patch 1: move SDL_GL_SetAttribute before SDL_CreateWindow
+old1 = '''    if (scon->opengl) {
         flags |= SDL_WINDOW_OPENGL;
     }
 #endif
 
     scon->real_window = SDL_CreateWindow'''
-new = '''    if (scon->opengl) {
+new1 = '''    if (scon->opengl) {
         flags |= SDL_WINDOW_OPENGL;
+        /*
+         * SDL_GL_SetAttribute MUST be called before SDL_CreateWindow because
+         * EGL chooses the framebuffer config at window-creation time, not at
+         * SDL_GL_CreateContext time.  Setting attributes after SDL_CreateWindow
+         * is too late for EGL and causes SDL_GL_CreateContext to return NULL.
+         */
         if (scon->opts->gl == DISPLAY_GL_MODE_ES) {
             SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,
                                 SDL_GL_CONTEXT_PROFILE_ES);
@@ -168,19 +261,64 @@ new = '''    if (scon->opengl) {
 #endif
 
     scon->real_window = SDL_CreateWindow'''
-if old in content:
-    content = content.replace(old, new)
-    # Also add error check after SDL_GL_CreateContext
-    content = content.replace(
-        'scon->winctx = SDL_GL_CreateContext(scon->real_window);\n        SDL_GL_SetSwapInterval(0);',
-        'scon->winctx = SDL_GL_CreateContext(scon->real_window);\n        if (!scon->winctx) { fprintf(stderr, \"SDL_GL_CreateContext failed: %s\\n\", SDL_GetError()); }\n        SDL_GL_SetSwapInterval(0);'
-    )
+
+# Patch 2: replace the old opengl branch that only creates winctx with one that
+#          also creates a Metal renderer for the readback path.
+old2 = '''    if (scon->opengl) {
+        const char *driver = \"opengl\";
+
+        if (scon->opts->gl == DISPLAY_GL_MODE_ES) {
+            driver = \"opengles2\";
+        }
+
+        SDL_SetHint(SDL_HINT_RENDER_DRIVER, driver);
+        SDL_SetHint(SDL_HINT_RENDER_BATCHING, \"1\");
+
+        scon->winctx = SDL_GL_CreateContext(scon->real_window);
+        SDL_GL_SetSwapInterval(0);
+    } else {
+        /* The SDL renderer is only used by sdl2-2D, when OpenGL is disabled */
+        scon->real_renderer = SDL_CreateRenderer(scon->real_window, -1, 0);
+    }'''
+new2 = '''    if (scon->opengl) {
+        scon->winctx = SDL_GL_CreateContext(scon->real_window);
+        if (!scon->winctx) {
+            fprintf(stderr, \"sdl2_window_create: SDL_GL_CreateContext failed: %s\\n\",
+                    SDL_GetError());
+        }
+        SDL_GL_SetSwapInterval(0);
+        /*
+         * With Mesa surfaceless EGL, there is no native window surface to
+         * present to.  Create a Metal-backed SDL renderer on the same window
+         * so we can upload rendered frames via SDL_RenderCopy and present
+         * them to the screen without using SDL_GL_SwapWindow.
+         */
+        SDL_SetHint(SDL_HINT_RENDER_DRIVER, \"metal\");
+        scon->real_renderer = SDL_CreateRenderer(scon->real_window, -1,
+                                                 SDL_RENDERER_ACCELERATED);
+        if (!scon->real_renderer) {
+            fprintf(stderr, \"sdl2_window_create: SDL_CreateRenderer(metal) failed: %s\\n\",
+                    SDL_GetError());
+        }
+    } else {
+        /* The SDL renderer is only used by sdl2-2D, when OpenGL is disabled */
+        scon->real_renderer = SDL_CreateRenderer(scon->real_window, -1, 0);
+    }'''
+
+applied = []
+if old1 in content:
+    content = content.replace(old1, new1)
+    applied.append('SetAttribute-before-CreateWindow')
+if old2 in content:
+    content = content.replace(old2, new2)
+    applied.append('metal-renderer')
+if applied:
     open(path, 'w').write(content)
-    print('Patched ui/sdl2.c: moved SDL_GL_SetAttribute before SDL_CreateWindow')
-elif 'SDL_GL_CONTEXT_PROFILE_ES' in content:
+    print('Patched ui/sdl2.c:', ', '.join(applied))
+elif 'SDL_HINT_RENDER_DRIVER, \"metal\"' in content:
     print('ui/sdl2.c already patched')
 else:
-    print('WARNING: could not patch ui/sdl2.c - pattern not found', flush=True)
+    print('WARNING: could not patch ui/sdl2.c - patterns not found', flush=True)
 "
 
 echo ""
@@ -247,15 +385,19 @@ echo ""
 echo "==> Building QEMU..."
 ninja -C build install
 
-# Fix SDL2 rpath so binaries can find @rpath/libSDL2-2.0.0.dylib at runtime
+# Fix rpaths in QEMU binaries:
+#   - install/lib  : finds libSDL2-2.0.0.dylib, libepoxy.0.dylib, libvirglrenderer.so, etc.
+#   - Mesa/lib     : finds libEGL.dylib, libGLESv2.dylib (needed by SDL's EGL loader)
+#   - /opt/homebrew/lib : finds libsnappy, libgnutls, etc.
+# These rpaths are embedded in the binary so the binary works without DYLD_LIBRARY_PATH.
 echo ""
 echo "==> Fixing rpath in installed QEMU binaries..."
 for bin in "$INSTALL/bin/qemu-system-x86_64" "$INSTALL/bin/qemu-system-aarch64"; do
     [ -f "$bin" ] || continue
-    if ! otool -l "$bin" 2>/dev/null | grep -q "path $INSTALL/lib "; then
-        install_name_tool -add_rpath "$INSTALL/lib" "$bin" 2>/dev/null || true
-        echo "  Added rpath to $bin"
-    fi
+    for rpath in "$INSTALL/lib" "$MESA/lib" "/opt/homebrew/lib"; do
+        install_name_tool -add_rpath "$rpath" "$bin" 2>/dev/null || true
+    done
+    echo "  Fixed rpaths in $bin"
 done
 
 echo ""

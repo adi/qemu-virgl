@@ -4,3 +4,4 @@ virglrenderer/
 qemu/
 *.pyc
 __pycache__/
+SDL/
