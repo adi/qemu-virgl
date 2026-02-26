@@ -1,0 +1,194 @@
+From f386e5c2f2d781b5ff9dbf69bc43dd9609a454ff Mon Sep 17 00:00:00 2001
+From: Adrian Punga <adrian.punga@gmail.com>
+Date: Thu, 26 Feb 2026 10:30:19 +0200
+Subject: [PATCH] fix(sdl2): guard macOS caption updates to main thread
+
+---
+ ui/sdl2.c | 118 +++++++++++++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 103 insertions(+), 15 deletions(-)
+
+diff --git a/ui/sdl2.c b/ui/sdl2.c
+index 032dc14..a6b6155 100644
+--- a/ui/sdl2.c
++++ b/ui/sdl2.c
+@@ -34,6 +34,11 @@
+ #include "system/system.h"
+ #include "qemu/log.h"
+ #include "qemu-main.h"
++#include <pthread.h>
++#include "qemu/main-loop.h"
++#ifdef CONFIG_OPENGL
++#include "ui/egl-helpers.h"
++#endif
+ 
+ static int sdl2_num_outputs;
+ static struct sdl2_console *sdl2_console;
+@@ -65,6 +70,36 @@ static Notifier mouse_mode_notifier;
+ 
+ static void sdl_update_caption(struct sdl2_console *scon);
+ 
++static int sdl2_input_width(struct sdl2_console *scon)
++{
++    int w = surface_width(scon->surface);
++#ifdef CONFIG_OPENGL
++    if (scon->opengl && scon->scanout_mode) {
++        if (scon->guest_fb.width > 0) {
++            w = scon->guest_fb.width;
++        } else if (scon->w > 0) {
++            w = scon->w;
++        }
++    }
++#endif
++    return w;
++}
++
++static int sdl2_input_height(struct sdl2_console *scon)
++{
++    int h = surface_height(scon->surface);
++#ifdef CONFIG_OPENGL
++    if (scon->opengl && scon->scanout_mode) {
++        if (scon->guest_fb.height > 0) {
++            h = scon->guest_fb.height;
++        } else if (scon->h > 0) {
++            h = scon->h;
++        }
++    }
++#endif
++    return h;
++}
++
+ static struct sdl2_console *get_scon_from_window(uint32_t window_id)
+ {
+     int i;
+@@ -96,6 +131,18 @@ void sdl2_window_create(struct sdl2_console *scon)
+ #ifdef CONFIG_OPENGL
+     if (scon->opengl) {
+         flags |= SDL_WINDOW_OPENGL;
++        /*
++         * SDL_GL_SetAttribute MUST be called before SDL_CreateWindow because
++         * EGL chooses the framebuffer config at window-creation time, not at
++         * SDL_GL_CreateContext time.  Setting attributes after SDL_CreateWindow
++         * is too late for EGL and causes SDL_GL_CreateContext to return NULL.
++         */
++        if (scon->opts->gl == DISPLAY_GL_MODE_ES) {
++            SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,
++                                SDL_GL_CONTEXT_PROFILE_ES);
++            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
++            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
++        }
+     }
+ #endif
+ 
+@@ -104,17 +151,27 @@ void sdl2_window_create(struct sdl2_console *scon)
+                                          surface_width(scon->surface),
+                                          surface_height(scon->surface),
+                                          flags);
++    if (!scon->real_window) {
++        fprintf(stderr, "sdl2_window_create: SDL_CreateWindow failed: %s\n",
++                SDL_GetError());
++        return;
++    }
+     if (scon->opengl) {
+-        const char *driver = "opengl";
+-
+-        if (scon->opts->gl == DISPLAY_GL_MODE_ES) {
+-            driver = "opengles2";
+-        }
+-
+-        SDL_SetHint(SDL_HINT_RENDER_DRIVER, driver);
+-        SDL_SetHint(SDL_HINT_RENDER_BATCHING, "1");
+-
+         scon->winctx = SDL_GL_CreateContext(scon->real_window);
++        if (!scon->winctx) {
++            fprintf(stderr, "sdl2_window_create: SDL_GL_CreateContext failed: %s\n",
++                    SDL_GetError());
++        } else {
++            EGLDisplay egl_dpy = eglGetCurrentDisplay();
++            EGLint egl_major = 0;
++            EGLint egl_minor = 0;
++            if (egl_dpy != EGL_NO_DISPLAY &&
++                eglInitialize(egl_dpy, &egl_major, &egl_minor)) {
++                qemu_egl_display = egl_dpy;
++                qemu_egl_mode = (scon->opts->gl == DISPLAY_GL_MODE_ES) ?
++                                DISPLAY_GL_MODE_ES : DISPLAY_GL_MODE_CORE;
++            }
++        }
+         SDL_GL_SetSwapInterval(0);
+     } else {
+         /* The SDL renderer is only used by sdl2-2D, when OpenGL is disabled */
+@@ -199,6 +256,11 @@ static void sdl_update_caption(struct sdl2_console *scon)
+     }
+ 
+     if (scon->real_window) {
++#ifdef CONFIG_DARWIN
++        if (!pthread_main_np() || !qemu_in_main_thread()) {
++            return;
++        }
++#endif
+         SDL_SetWindowTitle(scon->real_window, win_title);
+     }
+ }
+@@ -319,10 +381,18 @@ static void sdl_send_mouse_event(struct sdl2_console *scon, int dx, int dy,
+     }
+ 
+     if (qemu_input_is_absolute(scon->dcl.con)) {
++        int input_w = sdl2_input_width(scon);
++        int input_h = sdl2_input_height(scon);
++        if (input_w <= 0) {
++            input_w = 1;
++        }
++        if (input_h <= 0) {
++            input_h = 1;
++        }
+         qemu_input_queue_abs(scon->dcl.con, INPUT_AXIS_X,
+-                             x, 0, surface_width(scon->surface));
++                             x, 0, input_w);
+         qemu_input_queue_abs(scon->dcl.con, INPUT_AXIS_Y,
+-                             y, 0, surface_height(scon->surface));
++                             y, 0, input_h);
+     } else {
+         if (guest_cursor) {
+             x -= guest_x;
+@@ -509,8 +579,20 @@ static void handle_mousemotion(SDL_Event *ev)
+             sdl_grab_start(scon);
+         }
+     }
+-    surf_w = surface_width(scon->surface);
+-    surf_h = surface_height(scon->surface);
++    if (scr_w <= 0) {
++        scr_w = 1;
++    }
++    if (scr_h <= 0) {
++        scr_h = 1;
++    }
++    surf_w = sdl2_input_width(scon);
++    surf_h = sdl2_input_height(scon);
++    if (surf_w <= 0) {
++        surf_w = 1;
++    }
++    if (surf_h <= 0) {
++        surf_h = 1;
++    }
+     x = (int64_t)ev->motion.x * surf_w / scr_w;
+     y = (int64_t)ev->motion.y * surf_h / scr_h;
+     dx = (int64_t)ev->motion.xrel * surf_w / scr_w;
+@@ -533,8 +615,14 @@ static void handle_mousebutton(SDL_Event *ev)
+ 
+     bev = &ev->button;
+     SDL_GetWindowSize(scon->real_window, &scr_w, &scr_h);
+-    x = (int64_t)bev->x * surface_width(scon->surface) / scr_w;
+-    y = (int64_t)bev->y * surface_height(scon->surface) / scr_h;
++    if (scr_w <= 0) {
++        scr_w = 1;
++    }
++    if (scr_h <= 0) {
++        scr_h = 1;
++    }
++    x = (int64_t)bev->x * sdl2_input_width(scon) / scr_w;
++    y = (int64_t)bev->y * sdl2_input_height(scon) / scr_h;
+ 
+     if (!gui_grab && !qemu_input_is_absolute(scon->dcl.con)) {
+         if (ev->type == SDL_MOUSEBUTTONUP && bev->button == SDL_BUTTON_LEFT) {
+-- 
+2.50.1 (Apple Git-155)
+

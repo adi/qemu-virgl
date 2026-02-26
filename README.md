@@ -47,6 +47,10 @@ git clone https://github.com/libsdl-org/SDL.git --branch SDL2 SDL
 ./build.sh
 ```
 
+`build.sh` applies the local patch series from:
+- `patches/sdl2/*.patch`
+- `patches/qemu-upstream/*.patch`
+
 The first build takes ~10-15 minutes. Subsequent builds are incremental.
 
 ## Run a VM
@@ -134,6 +138,29 @@ All subsequent GL calls fail with "glCreateShader called without a rendering con
 reported by Mesa as "compile vertex error (null)".
 **Fix**: Move `SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES)`
 and version attributes to BEFORE `SDL_CreateWindow` in `ui/sdl2.c`.
+
+### Problem 11: surfaceless EGL pbuffer stayed at stale size after resize/maximize
+
+With surfaceless EGL, presentation reads back from the offscreen pbuffer. If that pbuffer
+is only created once, window restore/maximize/move paths can show clipped subregions
+(often old 800x600 bounds).
+**Fix**:
+- recreate `windowdata.egl_surface` in `Cocoa_GLES_SetupWindow`
+- re-run `Cocoa_GLES_SetupWindow` on `windowDidResize`
+- size pbuffer from backing-pixel dimensions (`convertRectToBacking`)
+
+### Problem 12: mixed EGL/Metal path lost OpenGL eligibility for later GL contexts
+
+`SDL_Metal_CreateView` could clear `SDL_WINDOW_OPENGL`, which breaks later GL context
+creation in the surfaceless+readback path.
+**Fix**: preserve `SDL_WINDOW_OPENGL` when attaching a Metal view; only tear down Vulkan
+state when applicable.
+
+### Problem 13: macOS AppKit abort from non-main-thread window title updates
+
+QEMU mouse/input notifier paths can trigger caption updates off the Cocoa main thread,
+causing `NSWindow geometry should only be modified on the main thread`.
+**Fix**: guard Darwin caption updates with both `pthread_main_np()` and `qemu_in_main_thread()`.
 
 ## Architecture
 

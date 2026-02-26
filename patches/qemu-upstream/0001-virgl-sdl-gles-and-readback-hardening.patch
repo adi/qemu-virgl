@@ -1,0 +1,281 @@
+From 843eab9f2fe8b9576657e650794c1d0fb20167f5 Mon Sep 17 00:00:00 2001
+From: Adrian Punga <adrian.punga@gmail.com>
+Date: Thu, 26 Feb 2026 10:37:16 +0200
+Subject: [PATCH] fix(virgl-sdl): enforce GLES init and robust readback present
+
+---
+ hw/display/virtio-gpu-virgl.c |   6 +-
+ ui/sdl2-gl.c                  | 165 +++++++++++++++++++++++++++++++---
+ 2 files changed, 158 insertions(+), 13 deletions(-)
+
+diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
+index 0f75482..51b5a7b 100644
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -1170,7 +1170,7 @@ int virtio_gpu_virgl_init(VirtIOGPU *g)
+     VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
+ 
+ #if VIRGL_RENDERER_CALLBACKS_VERSION >= 4
+-    if (qemu_egl_display) {
++    if (qemu_egl_display && qemu_egl_mode != DISPLAY_GL_MODE_ES) {
+         virtio_gpu_3d_cbs.version = 4;
+         virtio_gpu_3d_cbs.get_egl_display = virgl_get_egl_display;
+     }
+@@ -1185,7 +1185,9 @@ int virtio_gpu_virgl_init(VirtIOGPU *g)
+         flags |= VIRGL_RENDERER_VENUS | VIRGL_RENDERER_RENDER_SERVER;
+     }
+ #endif
+-
++    if (qemu_egl_mode == DISPLAY_GL_MODE_ES) {
++        flags |= VIRGL_RENDERER_USE_GLES;
++    }
+     ret = virgl_renderer_init(g, flags, &virtio_gpu_3d_cbs);
+     if (ret != 0) {
+         error_report("virgl could not be initialized: %d", ret);
+diff --git a/ui/sdl2-gl.c b/ui/sdl2-gl.c
+index 3be17d1..7ef0d89 100644
+--- a/ui/sdl2-gl.c
++++ b/ui/sdl2-gl.c
+@@ -29,6 +29,93 @@
+ #include "ui/console.h"
+ #include "ui/input.h"
+ #include "ui/sdl2.h"
++#include <SDL2/SDL_opengl.h>
++
++/*
++ * sdl2_gl_present_via_readback - read back the current GL framebuffer and
++ * present it through the SDL Metal renderer (scon->real_renderer).
++ *
++ * This is necessary when using Mesa surfaceless EGL on macOS: there is no
++ * native window surface, so SDL_GL_SwapWindow does nothing useful.  Instead
++ * we read pixels from the pbuffer, upload them to an SDL streaming texture,
++ * and blit to the screen via the Metal renderer.
++ *
++ * glReadPixels returns rows bottom-to-top (OpenGL convention), but SDL
++ * expects top-to-bottom, so we flip vertically with SDL_FLIP_VERTICAL.
++ */
++static void sdl2_gl_present_via_readback(struct sdl2_console *scon,
++                                         int gl_w, int gl_h,
++                                         int win_w, int win_h)
++{
++    void *pixels;
++    size_t pixel_bytes;
++
++    if (gl_w <= 0 || gl_h <= 0 || win_w <= 0 || win_h <= 0) {
++        return;
++    }
++
++    if (!scon->real_renderer) {
++        /*
++         * Create the Metal renderer lazily after virgl context creation.
++         * Creating it in sdl2_window_create() can interfere with subsequent
++         * SDL_GL_CreateContext() calls used by virgl context probing.
++         */
++        SDL_SetHint(SDL_HINT_RENDER_DRIVER, "metal");
++        scon->real_renderer = SDL_CreateRenderer(scon->real_window, -1,
++                                                 SDL_RENDERER_ACCELERATED);
++        if (!scon->real_renderer) {
++            SDL_GL_SwapWindow(scon->real_window);
++            return;
++        }
++    }
++
++    pixel_bytes = (size_t)gl_w * (size_t)gl_h * 4;
++    pixels = g_malloc(pixel_bytes);
++    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
++    /*
++     * virgl command streams can leave pixel-pack state configured for
++     * guest transfers. Normalize before readback so SDL upload receives a
++     * tightly packed RGBA buffer.
++     */
++    glPixelStorei(GL_PACK_ALIGNMENT, 1);
++#ifdef GL_PACK_ROW_LENGTH
++    glPixelStorei(GL_PACK_ROW_LENGTH, 0);
++#endif
++#ifdef GL_PACK_SKIP_PIXELS
++    glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
++#endif
++#ifdef GL_PACK_SKIP_ROWS
++    glPixelStorei(GL_PACK_SKIP_ROWS, 0);
++#endif
++    glReadPixels(0, 0, gl_w, gl_h, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
++
++    /* Recreate texture if size changed */
++    if (scon->texture) {
++        int tw, th;
++        SDL_QueryTexture(scon->texture, NULL, NULL, &tw, &th);
++        if (tw != gl_w || th != gl_h) {
++            SDL_DestroyTexture(scon->texture);
++            scon->texture = NULL;
++        }
++    }
++    if (!scon->texture) {
++        scon->texture = SDL_CreateTexture(scon->real_renderer,
++                                          SDL_PIXELFORMAT_RGBA32,
++                                          SDL_TEXTUREACCESS_STREAMING,
++                                          gl_w, gl_h);
++    }
++
++    SDL_UpdateTexture(scon->texture, NULL, pixels, gl_w * 4);
++    g_free(pixels);
++
++    /* Ensure no stale SDL renderer clip/viewport constrains present. */
++    SDL_RenderSetViewport(scon->real_renderer, NULL);
++    SDL_RenderSetClipRect(scon->real_renderer, NULL);
++    SDL_RenderClear(scon->real_renderer);
++    SDL_RenderCopyEx(scon->real_renderer, scon->texture,
++                     NULL, NULL, 0, NULL, SDL_FLIP_VERTICAL);
++    SDL_RenderPresent(scon->real_renderer);
++}
+ 
+ static void sdl2_set_scanout_mode(struct sdl2_console *scon, bool scanout)
+ {
+@@ -48,16 +135,21 @@ static void sdl2_set_scanout_mode(struct sdl2_console *scon, bool scanout)
+ 
+ static void sdl2_gl_render_surface(struct sdl2_console *scon)
+ {
+-    int ww, wh;
++    int win_w, win_h, draw_w, draw_h;
+ 
+     SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
+     sdl2_set_scanout_mode(scon, false);
+ 
+-    SDL_GetWindowSize(scon->real_window, &ww, &wh);
+-    surface_gl_setup_viewport(scon->gls, scon->surface, ww, wh);
++    SDL_GetWindowSize(scon->real_window, &win_w, &win_h);
++    SDL_GL_GetDrawableSize(scon->real_window, &draw_w, &draw_h);
++    if (draw_w <= 0 || draw_h <= 0) {
++        draw_w = win_w;
++        draw_h = win_h;
++    }
++    surface_gl_setup_viewport(scon->gls, scon->surface, draw_w, draw_h);
+ 
+     surface_gl_render_texture(scon->gls, scon->surface);
+-    SDL_GL_SwapWindow(scon->real_window);
++    sdl2_gl_present_via_readback(scon, draw_w, draw_h, win_w, win_h);
+ }
+ 
+ void sdl2_gl_update(DisplayChangeListener *dcl,
+@@ -98,6 +190,7 @@ void sdl2_gl_switch(DisplayChangeListener *dcl,
+ 
+     if (!scon->real_window) {
+         sdl2_window_create(scon);
++        SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
+         scon->gls = qemu_gl_init_shader();
+     } else if (old_surface &&
+                ((surface_width(old_surface)  != surface_width(new_surface)) ||
+@@ -141,6 +234,8 @@ QEMUGLContext sdl2_gl_create_context(DisplayGLCtx *dgc,
+ {
+     struct sdl2_console *scon = container_of(dgc, struct sdl2_console, dgc);
+     SDL_GLContext ctx;
++    int ctx_major = params->major_ver;
++    int ctx_minor = params->minor_ver;
+ 
+     assert(scon->opengl);
+ 
+@@ -154,11 +249,26 @@ QEMUGLContext sdl2_gl_create_context(DisplayGLCtx *dgc,
+     } else if (scon->opts->gl == DISPLAY_GL_MODE_ES) {
+         SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,
+                             SDL_GL_CONTEXT_PROFILE_ES);
++        /*
++         * virgl probes desktop GL 4.x down to 3.0, but ES contexts top out at
++         * 3.x. Clamp requests so SDL can create a valid ES context instead of
++         * failing all probes on the first unsupported major version.
++         */
++        if (ctx_major > 3) {
++            ctx_major = 3;
++            ctx_minor = 2;
++        }
+     }
+-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, params->major_ver);
+-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, params->minor_ver);
++    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, ctx_major);
++    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, ctx_minor);
+ 
+     ctx = SDL_GL_CreateContext(scon->real_window);
++    if (!ctx) {
++        fprintf(stderr,
++                "sdl2_gl_create_context: req=%d.%d eff=%d.%d gl_mode=%d failed: %s\n",
++                params->major_ver, params->minor_ver, ctx_major, ctx_minor,
++                scon->opts->gl, SDL_GetError());
++    }
+ 
+     /* If SDL fail to create a GL context and we use the "on" flag,
+      * then try to fallback to GLES.
+@@ -167,6 +277,11 @@ QEMUGLContext sdl2_gl_create_context(DisplayGLCtx *dgc,
+         SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,
+                             SDL_GL_CONTEXT_PROFILE_ES);
+         ctx = SDL_GL_CreateContext(scon->real_window);
++        if (!ctx) {
++            fprintf(stderr,
++                    "sdl2_gl_create_context: fallback ES failed: %s\n",
++                    SDL_GetError());
++        }
+     }
+     return (QEMUGLContext)ctx;
+ }
+@@ -210,6 +325,8 @@ void sdl2_gl_scanout_texture(DisplayChangeListener *dcl,
+ {
+     struct sdl2_console *scon = container_of(dcl, struct sdl2_console, dcl);
+ 
++    (void)d3d_tex2d;
++
+     assert(scon->opengl);
+     scon->x = x;
+     scon->y = y;
+@@ -224,11 +341,31 @@ void sdl2_gl_scanout_texture(DisplayChangeListener *dcl,
+                          backing_id, false);
+ }
+ 
++static void sdl2_gl_blit_scanout(struct sdl2_console *scon)
++{
++    /*
++     * virgl command streams can leave GL state (notably scissor/depth/blend)
++     * active on this context. Ensure scanout blit always runs with a full
++     * unclipped color write path.
++     */
++    glDisable(GL_SCISSOR_TEST);
++    glDisable(GL_DEPTH_TEST);
++    glDisable(GL_STENCIL_TEST);
++    glDisable(GL_BLEND);
++    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
++    egl_fb_blit(&scon->win_fb, &scon->guest_fb, !scon->y0_top);
++}
++
+ void sdl2_gl_scanout_flush(DisplayChangeListener *dcl,
+                            uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+ {
+     struct sdl2_console *scon = container_of(dcl, struct sdl2_console, dcl);
+-    int ww, wh;
++    int win_w, win_h, draw_w, draw_h;
++
++    (void)x;
++    (void)y;
++    (void)w;
++    (void)h;
+ 
+     assert(scon->opengl);
+     if (!scon->scanout_mode) {
+@@ -240,9 +377,15 @@ void sdl2_gl_scanout_flush(DisplayChangeListener *dcl,
+ 
+     SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
+ 
+-    SDL_GetWindowSize(scon->real_window, &ww, &wh);
+-    egl_fb_setup_default(&scon->win_fb, ww, wh, 0, 0);
+-    egl_fb_blit(&scon->win_fb, &scon->guest_fb, !scon->y0_top);
++    SDL_GetWindowSize(scon->real_window, &win_w, &win_h);
++    SDL_GL_GetDrawableSize(scon->real_window, &draw_w, &draw_h);
++    if (draw_w <= 0 || draw_h <= 0) {
++        draw_w = win_w;
++        draw_h = win_h;
++    }
++
++    egl_fb_setup_default(&scon->win_fb, draw_w, draw_h, 0, 0);
++    sdl2_gl_blit_scanout(scon);
+ 
+-    SDL_GL_SwapWindow(scon->real_window);
++    sdl2_gl_present_via_readback(scon, draw_w, draw_h, win_w, win_h);
+ }
+-- 
+2.50.1 (Apple Git-155)
+

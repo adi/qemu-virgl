@@ -36,6 +36,47 @@ fi
 
 mkdir -p "$INSTALL"
 
+apply_patch_if_needed() {
+    local repo="$1"
+    local patch="$2"
+
+    if [ ! -f "$patch" ]; then
+        echo "[ERR] Patch file not found: $patch"
+        return 1
+    fi
+
+    if git -C "$repo" apply --reverse --check "$patch" >/dev/null 2>&1; then
+        echo "==> Patch already applied: $(basename "$patch")"
+        return 0
+    fi
+
+    if git -C "$repo" apply --check "$patch" >/dev/null 2>&1; then
+        git -C "$repo" apply "$patch"
+        echo "==> Applied patch: $(basename "$patch")"
+        return 0
+    fi
+
+    echo "[ERR] Failed to apply patch: $patch"
+    git -C "$repo" apply --check "$patch"
+    return 1
+}
+
+apply_patch_dir() {
+    local repo="$1"
+    local patch_dir="$2"
+    local patch
+
+    if [ ! -d "$patch_dir" ]; then
+        echo "[ERR] Missing patch directory: $patch_dir"
+        return 1
+    fi
+
+    for patch in "$patch_dir"/*.patch; do
+        [ -f "$patch" ] || continue
+        apply_patch_if_needed "$repo" "$patch"
+    done
+}
+
 # ── 1. libepoxy (with EGL patched for macOS) ─────────────────────────────────
 echo ""
 echo "==> Building libepoxy..."
@@ -149,60 +190,9 @@ ninja -C build install
 # macOS 26.1 has a broken Apple OpenGL.framework (CGLChoosePixelFormat crashes).
 # Build SDL2 with SDL_OPENGLES=ON to use Mesa EGL instead of Apple CGL.
 echo ""
-echo "==> Patching SDL2 source for Mesa surfaceless EGL on macOS..."
+echo "==> Applying SDL2 patch series..."
 cd "$ROOT/SDL"
-
-# Patch SDL_cocoaopengles.m:
-#   1. Use EGL_PLATFORM_SURFACELESS_MESA so Mesa's eglGetPlatformDisplayEXT is used
-#      (eglGetDisplay(EGL_DEFAULT_DISPLAY) fails on macOS with Mesa → "Invalid window")
-#   2. Set is_offscreen=true so SDL_EGL_ChooseConfig adds EGL_PBUFFER_BIT
-#      (without it, eglCreatePbufferSurface fails on the chosen config)
-#   3. Create a pbuffer surface instead of a CALayer window surface
-#      (Mesa surfaceless EGL only supports pbuffer, not native window surfaces)
-python3 -c "
-import re, sys
-mesa = sys.argv[1]
-path = 'src/video/cocoa/SDL_cocoaopengles.m'
-content = open(path).read()
-
-# 1. Add EGL_PLATFORM_SURFACELESS_MESA define after the includes
-define_block = '''/* Mesa surfaceless platform — eglGetDisplay(EGL_DEFAULT_DISPLAY) fails on macOS
- * with Mesa, but eglGetPlatformDisplayEXT(EGL_PLATFORM_SURFACELESS_MESA, ...) works.
- */
-#ifndef EGL_PLATFORM_SURFACELESS_MESA
-#define EGL_PLATFORM_SURFACELESS_MESA 0x31DD
-#endif'''
-marker = '/* EGL implementation of SDL OpenGL support */'
-if define_block not in content:
-    content = content.replace(marker, marker + '\n\n' + define_block)
-
-# 2. Change platform=0 to EGL_PLATFORM_SURFACELESS_MESA in both LoadLibrary calls
-content = content.replace(
-    'SDL_EGL_LoadLibrary(_this, NULL, EGL_DEFAULT_DISPLAY, 0)',
-    'SDL_EGL_LoadLibrary(_this, NULL, EGL_DEFAULT_DISPLAY, EGL_PLATFORM_SURFACELESS_MESA)'
-)
-
-# 3. Remove unused NSView* v; declaration
-content = re.sub(r'int Cocoa_GLES_SetupWindow\(_THIS, SDL_Window \* window\)\n\{\n    NSView\* v;\n',
-                 'int Cocoa_GLES_SetupWindow(_THIS, SDL_Window * window)\n{\n', content)
-
-# 4. Set is_offscreen=SDL_TRUE and use pbuffer instead of CALayer surface
-old_surface = '''    /* Create the GLES window surface */
-    v = windowdata.nswindow.contentView;
-    windowdata.egl_surface = SDL_EGL_CreateSurface(_this, (__bridge NativeWindowType)[v layer]);'''
-new_surface = '''    /* Signal that we use an offscreen (pbuffer) surface so SDL_EGL_ChooseConfig
-     * adds EGL_SURFACE_TYPE = EGL_PBUFFER_BIT (required by Mesa surfaceless EGL). */
-    _this->egl_data->is_offscreen = SDL_TRUE;
-
-    /* Create the GLES window surface as a pbuffer (Mesa surfaceless EGL does not
-     * support native window surfaces; use an offscreen pbuffer instead). */
-    windowdata.egl_surface = SDL_EGL_CreateOffscreenSurface(_this, window->w, window->h);'''
-if old_surface in content:
-    content = content.replace(old_surface, new_surface)
-
-open(path, 'w').write(content)
-print('Patched SDL_cocoaopengles.m: surfaceless EGL + pbuffer surface')
-" "$MESA"
+apply_patch_dir "$ROOT/SDL" "$ROOT/patches/sdl2"
 
 echo "==> Building SDL2 (EGL/GLES2 backend)..."
 
@@ -224,102 +214,9 @@ cmake --install build
 
 # ── 4. QEMU (with virgl + HVF + SDL) ─────────────────────────────────────────
 echo ""
-echo "==> Patching QEMU source for macOS GL/EGL..."
+echo "==> Applying QEMU patch series..."
 cd "$ROOT/qemu"
-
-# Fix 1: SDL_GL_SetAttribute for GLES must be called BEFORE SDL_CreateWindow.
-# Fix 2: After creating the GL context, also create a Metal SDL renderer for
-#         the readback display path (Mesa surfaceless EGL has no native window
-#         surface, so we glReadPixels → SDL_Texture → Metal renderer instead of
-#         SDL_GL_SwapWindow).
-python3 -c "
-path = 'ui/sdl2.c'
-content = open(path).read()
-
-# Patch 1: move SDL_GL_SetAttribute before SDL_CreateWindow
-old1 = '''    if (scon->opengl) {
-        flags |= SDL_WINDOW_OPENGL;
-    }
-#endif
-
-    scon->real_window = SDL_CreateWindow'''
-new1 = '''    if (scon->opengl) {
-        flags |= SDL_WINDOW_OPENGL;
-        /*
-         * SDL_GL_SetAttribute MUST be called before SDL_CreateWindow because
-         * EGL chooses the framebuffer config at window-creation time, not at
-         * SDL_GL_CreateContext time.  Setting attributes after SDL_CreateWindow
-         * is too late for EGL and causes SDL_GL_CreateContext to return NULL.
-         */
-        if (scon->opts->gl == DISPLAY_GL_MODE_ES) {
-            SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,
-                                SDL_GL_CONTEXT_PROFILE_ES);
-            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
-            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
-        }
-    }
-#endif
-
-    scon->real_window = SDL_CreateWindow'''
-
-# Patch 2: replace the old opengl branch that only creates winctx with one that
-#          also creates a Metal renderer for the readback path.
-old2 = '''    if (scon->opengl) {
-        const char *driver = \"opengl\";
-
-        if (scon->opts->gl == DISPLAY_GL_MODE_ES) {
-            driver = \"opengles2\";
-        }
-
-        SDL_SetHint(SDL_HINT_RENDER_DRIVER, driver);
-        SDL_SetHint(SDL_HINT_RENDER_BATCHING, \"1\");
-
-        scon->winctx = SDL_GL_CreateContext(scon->real_window);
-        SDL_GL_SetSwapInterval(0);
-    } else {
-        /* The SDL renderer is only used by sdl2-2D, when OpenGL is disabled */
-        scon->real_renderer = SDL_CreateRenderer(scon->real_window, -1, 0);
-    }'''
-new2 = '''    if (scon->opengl) {
-        scon->winctx = SDL_GL_CreateContext(scon->real_window);
-        if (!scon->winctx) {
-            fprintf(stderr, \"sdl2_window_create: SDL_GL_CreateContext failed: %s\\n\",
-                    SDL_GetError());
-        }
-        SDL_GL_SetSwapInterval(0);
-        /*
-         * With Mesa surfaceless EGL, there is no native window surface to
-         * present to.  Create a Metal-backed SDL renderer on the same window
-         * so we can upload rendered frames via SDL_RenderCopy and present
-         * them to the screen without using SDL_GL_SwapWindow.
-         */
-        SDL_SetHint(SDL_HINT_RENDER_DRIVER, \"metal\");
-        scon->real_renderer = SDL_CreateRenderer(scon->real_window, -1,
-                                                 SDL_RENDERER_ACCELERATED);
-        if (!scon->real_renderer) {
-            fprintf(stderr, \"sdl2_window_create: SDL_CreateRenderer(metal) failed: %s\\n\",
-                    SDL_GetError());
-        }
-    } else {
-        /* The SDL renderer is only used by sdl2-2D, when OpenGL is disabled */
-        scon->real_renderer = SDL_CreateRenderer(scon->real_window, -1, 0);
-    }'''
-
-applied = []
-if old1 in content:
-    content = content.replace(old1, new1)
-    applied.append('SetAttribute-before-CreateWindow')
-if old2 in content:
-    content = content.replace(old2, new2)
-    applied.append('metal-renderer')
-if applied:
-    open(path, 'w').write(content)
-    print('Patched ui/sdl2.c:', ', '.join(applied))
-elif 'SDL_HINT_RENDER_DRIVER, \"metal\"' in content:
-    print('ui/sdl2.c already patched')
-else:
-    print('WARNING: could not patch ui/sdl2.c - patterns not found', flush=True)
-"
+apply_patch_dir "$ROOT/qemu" "$ROOT/patches/qemu-upstream"
 
 echo ""
 echo "==> Configuring QEMU..."

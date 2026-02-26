@@ -1,0 +1,68 @@
+From 15e722ebe138fdb31c0884f7d8020be96db932e1 Mon Sep 17 00:00:00 2001
+From: Adrian Punga <adrian.punga@gmail.com>
+Date: Thu, 26 Feb 2026 10:37:16 +0200
+Subject: [PATCH] fix(egl): harden API bind and preserve OpenGL window state
+
+---
+ src/video/SDL_egl.c   | 10 +++++++++-
+ src/video/SDL_video.c | 16 ++++++++++------
+ 2 files changed, 19 insertions(+), 7 deletions(-)
+
+diff --git a/src/video/SDL_egl.c b/src/video/SDL_egl.c
+index 54595a0..0e7ff1a 100644
+--- a/src/video/SDL_egl.c
++++ b/src/video/SDL_egl.c
+@@ -1087,6 +1087,7 @@ SDL_GLContext SDL_EGL_CreateContext(_THIS, EGLSurface egl_surface)
+ int SDL_EGL_MakeCurrent(_THIS, EGLSurface egl_surface, SDL_GLContext context)
+ {
+     EGLContext egl_context = (EGLContext)context;
++    EGLenum api;
+ 
+     if (!_this->egl_data) {
+         return SDL_SetError("EGL not initialized");
+@@ -1103,7 +1104,14 @@ int SDL_EGL_MakeCurrent(_THIS, EGLSurface egl_surface, SDL_GLContext context)
+ 
+     /* Make sure current thread has a valid API bound to it. */
+     if (_this->egl_data->eglBindAPI) {
+-        _this->egl_data->eglBindAPI(_this->egl_data->apitype);
++        api = _this->egl_data->apitype;
++        if (api != EGL_OPENGL_ES_API && api != EGL_OPENGL_API && api != EGL_OPENVG_API) {
++            api = (_this->gl_config.profile_mask == SDL_GL_CONTEXT_PROFILE_ES) ? EGL_OPENGL_ES_API : EGL_OPENGL_API;
++            _this->egl_data->apitype = api;
++        }
++        if (!_this->egl_data->eglBindAPI(api)) {
++            return SDL_EGL_SetError("Unable to bind EGL API", "eglBindAPI");
++        }
+     }
+ 
+     /* The android emulator crashes badly if you try to eglMakeCurrent
+diff --git a/src/video/SDL_video.c b/src/video/SDL_video.c
+index 134cc05..599db0c 100644
+--- a/src/video/SDL_video.c
++++ b/src/video/SDL_video.c
+@@ -4810,12 +4810,16 @@ SDL_MetalView SDL_Metal_CreateView(SDL_Window *window)
+     CHECK_WINDOW_MAGIC(window, NULL);
+ 
+     if (!(window->flags & SDL_WINDOW_METAL)) {
+-        /* No problem, we can convert to Metal */
+-        if (window->flags & SDL_WINDOW_OPENGL) {
+-            window->flags &= ~SDL_WINDOW_OPENGL;
+-            SDL_GL_UnloadLibrary();
+-        }
+-        if (window->flags & SDL_WINDOW_VULKAN) {
++        /*
++         * Keep SDL_WINDOW_OPENGL when attaching a Metal view.
++         *
++         * On macOS surfaceless EGL setups, callers may present through Metal
++         * (readback path) while still creating additional GL contexts later
++         * for virgl. Clearing SDL_WINDOW_OPENGL here makes those context
++         * creations fail with "The specified window isn't an OpenGL window".
++         */
++        if ((window->flags & SDL_WINDOW_OPENGL) == 0 &&
++            (window->flags & SDL_WINDOW_VULKAN)) {
+             window->flags &= ~SDL_WINDOW_VULKAN;
+             SDL_Vulkan_UnloadLibrary();
+         }
+-- 
+2.50.1 (Apple Git-155)
+

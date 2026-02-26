@@ -1,0 +1,157 @@
+From 047e23ab97f3fc388db38c95117b0d2ff93f38d3 Mon Sep 17 00:00:00 2001
+From: Adrian Punga <adrian.punga@gmail.com>
+Date: Thu, 26 Feb 2026 10:30:19 +0200
+Subject: [PATCH] fix(cocoa-egl): recreate surfaceless pbuffer on resize
+
+---
+ src/video/cocoa/SDL_cocoaopengles.m | 73 ++++++++++++++++++++++++++---
+ src/video/cocoa/SDL_cocoawindow.m   | 13 +++++
+ 2 files changed, 79 insertions(+), 7 deletions(-)
+
+diff --git a/src/video/cocoa/SDL_cocoaopengles.m b/src/video/cocoa/SDL_cocoaopengles.m
+index baa8da8..3c0dc51 100644
+--- a/src/video/cocoa/SDL_cocoaopengles.m
++++ b/src/video/cocoa/SDL_cocoaopengles.m
+@@ -28,6 +28,13 @@
+ 
+ /* EGL implementation of SDL OpenGL support */
+ 
++/* Mesa surfaceless platform — eglGetDisplay(EGL_DEFAULT_DISPLAY) fails on macOS
++ * with Mesa, but eglGetPlatformDisplayEXT(EGL_PLATFORM_SURFACELESS_MESA, ...) works.
++ */
++#ifndef EGL_PLATFORM_SURFACELESS_MESA
++#define EGL_PLATFORM_SURFACELESS_MESA 0x31DD
++#endif
++
+ int Cocoa_GLES_LoadLibrary(_THIS, const char *path)
+ {
+     /* If the profile requested is not GL ES, switch over to WIN_GL functions  */
+@@ -50,7 +57,7 @@ int Cocoa_GLES_LoadLibrary(_THIS, const char *path)
+     }
+ 
+     if (_this->egl_data == NULL) {
+-        return SDL_EGL_LoadLibrary(_this, NULL, EGL_DEFAULT_DISPLAY, 0);
++        return SDL_EGL_LoadLibrary(_this, NULL, EGL_DEFAULT_DISPLAY, EGL_PLATFORM_SURFACELESS_MESA);
+     }
+ 
+     return 0;
+@@ -108,11 +115,12 @@ int Cocoa_GLES_MakeCurrent(_THIS, SDL_Window * window, SDL_GLContext context)
+ 
+ int Cocoa_GLES_SetupWindow(_THIS, SDL_Window * window)
+ {
+-    NSView* v;
+     /* The current context is lost in here; save it and reset it. */
+     SDL_WindowData *windowdata = (__bridge SDL_WindowData *) window->driverdata;
+     SDL_Window *current_win = SDL_GL_GetCurrentWindow();
+     SDL_GLContext current_ctx = SDL_GL_GetCurrentContext();
++    int pbuf_w = 1;
++    int pbuf_h = 1;
+ 
+ 
+     if (_this->egl_data == NULL) {
+@@ -120,22 +128,73 @@ int Cocoa_GLES_SetupWindow(_THIS, SDL_Window * window)
+         #if 0  /* When hint SDL_HINT_OPENGL_ES_DRIVER is set to "1" (e.g. for ANGLE support), _this->gl_config.driver_loaded can be 1, while the below lines function. */
+         SDL_assert(!_this->gl_config.driver_loaded);
+         #endif
+-        if (SDL_EGL_LoadLibrary(_this, NULL, EGL_DEFAULT_DISPLAY, 0) < 0) {
++        if (SDL_EGL_LoadLibrary(_this, NULL, EGL_DEFAULT_DISPLAY, EGL_PLATFORM_SURFACELESS_MESA) < 0) {
+             SDL_EGL_UnloadLibrary(_this);
+             return -1;
+         }
+         _this->gl_config.driver_loaded = 1;
+     }
+ 
+-    /* Create the GLES window surface */
+-    v = windowdata.nswindow.contentView;
+-    windowdata.egl_surface = SDL_EGL_CreateSurface(_this, (__bridge NativeWindowType)[v layer]);
++    /* Signal that we are using an offscreen (pbuffer) surface.  SDL_EGL_ChooseConfig
++     * adds EGL_SURFACE_TYPE = EGL_PBUFFER_BIT only when is_offscreen is true; without
++     * it the chosen config may lack pbuffer support and eglCreatePbufferSurface fails. */
++    _this->egl_data->is_offscreen = SDL_TRUE;
++
++    if (windowdata.egl_surface != EGL_NO_SURFACE) {
++        if (current_win || current_ctx) {
++            Cocoa_GLES_MakeCurrent(_this, NULL, NULL);
++        }
++        SDL_EGL_DestroySurface(_this, windowdata.egl_surface);
++        windowdata.egl_surface = EGL_NO_SURFACE;
++    }
++
++    if (windowdata.sdlContentView) {
++        NSRect bounds = [windowdata.sdlContentView bounds];
++        NSRect backing = [windowdata.sdlContentView convertRectToBacking:bounds];
++        pbuf_w = (int)backing.size.width;
++        pbuf_h = (int)backing.size.height;
++    } else if (windowdata.nswindow) {
++        NSRect content = [windowdata.nswindow contentRectForFrameRect:[windowdata.nswindow frame]];
++        pbuf_w = (int)content.size.width;
++        pbuf_h = (int)content.size.height;
++    }
++    if (pbuf_w <= 0) {
++        pbuf_w = window->w;
++    }
++    if (pbuf_h <= 0) {
++        pbuf_h = window->h;
++    }
++    if (pbuf_w <= 0) {
++        pbuf_w = 1;
++    }
++    if (pbuf_h <= 0) {
++        pbuf_h = 1;
++    }
++
++    /* Create the GLES window surface as a pbuffer (Mesa surfaceless EGL does not
++     * support native window surfaces; use an offscreen pbuffer instead). */
++    windowdata.egl_surface = SDL_EGL_CreateOffscreenSurface(_this, pbuf_w, pbuf_h);
+ 
+     if (windowdata.egl_surface == EGL_NO_SURFACE) {
+         return SDL_SetError("Could not create GLES window surface");
+     }
+ 
+-    return Cocoa_GLES_MakeCurrent(_this, current_win, current_ctx);
++    /* Restoring the previous context is best-effort here. On Mesa surfaceless
++     * EGL we can hit stale context handles during window setup; that should not
++     * fail window creation itself. */
++    if (current_win || current_ctx) {
++        if (Cocoa_GLES_MakeCurrent(_this, current_win, current_ctx) < 0) {
++            /* Clear SDL's current context bookkeeping when restore fails so
++             * follow-up window creation does not keep retrying stale handles. */
++            SDL_ClearError();
++            if (SDL_GL_MakeCurrent(NULL, NULL) < 0) {
++                SDL_ClearError();
++                Cocoa_GLES_MakeCurrent(_this, NULL, NULL);
++                SDL_ClearError();
++            }
++        }
++    }
++    return 0;
+ }
+ 
+ #endif /* SDL_VIDEO_DRIVER_COCOA && SDL_VIDEO_OPENGL_EGL */
+diff --git a/src/video/cocoa/SDL_cocoawindow.m b/src/video/cocoa/SDL_cocoawindow.m
+index 6447f8f..f634cc1 100644
+--- a/src/video/cocoa/SDL_cocoawindow.m
++++ b/src/video/cocoa/SDL_cocoawindow.m
+@@ -850,6 +850,19 @@ - (void)windowDidResize:(NSNotification *)aNotification
+ 
+     ScheduleContextUpdates(_data);
+ 
++#ifdef SDL_VIDEO_OPENGL_ES2
++#ifdef SDL_VIDEO_OPENGL_EGL
++    if ((window->flags & SDL_WINDOW_OPENGL) != 0) {
++        SDL_VideoDevice *_this = SDL_GetVideoDevice();
++        if (_this && _this->gl_config.profile_mask == SDL_GL_CONTEXT_PROFILE_ES) {
++            if (Cocoa_GLES_SetupWindow(_this, window) < 0) {
++                SDL_ClearError();
++            }
++        }
++    }
++#endif
++#endif
++
+     /* The window can move during a resize event, such as when maximizing
+        or resizing from a corner */
+     SDL_SendWindowEvent(window, SDL_WINDOWEVENT_MOVED, x, y);
+-- 
+2.50.1 (Apple Git-155)
+
